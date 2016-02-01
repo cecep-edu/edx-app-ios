@@ -1,5 +1,5 @@
-import org.yaml.snakeyaml.*
-import org.apache.commons.configuration.plist.*
+import com.dd.plist.*
+import org.edx.builder.TaskHelper
 
 // Dependencies
 buildscript {
@@ -8,33 +8,20 @@ buildscript {
     }
 
     dependencies {
-        classpath 'org.yaml:snakeyaml:1.14'
-        classpath 'commons-configuration:commons-configuration:1.10'
+        classpath 'com.googlecode.plist:dd-plist:1.16'
     }
 }
 
+apply plugin: 'edxapp'
+edx {
+    platform = IOS
+}
+
 // Configuration
-def workspace = 'edXVideoLocker.xcworkspace'
-def scheme = 'edXVideoLocker'
+def workspace = 'edX.xcworkspace'
+def scheme = 'edX'
 
-class Configuration {
-    def dir = 'default_config'
-    def configFiles = []
-
-    def ios(setup) {
-        setup.delegate = this
-        setup();
-    }
-
-    def android(setup) {
-        // Do nothing - we're not on android.
-        // This is just a stub so that the edx.properties file
-        // can find the symbol.
-    }
-
-    Configuration() {
-    }
-
+class IOSHelper {
     // Environment Variable Conveniences
     // Only valid when our task is invoked by an Xcode build
 
@@ -61,46 +48,16 @@ class Configuration {
         return builtProductsPath + '/' + wrapperName + '/config.plist'
     }
 
-    // List of files to load config keys from
-    def getConfigPaths() {
-        def result = []
-        for(configName in configFiles) {
-            result.add(dir + '/' + configName)
-        }
-        return result
-    }
-
-    // Loads our config YAML files, overwriting keys found in multiple files
-    // with the latest one in the list
-    def loadConfig() {
-        def yaml = new Yaml()
-        def properties = [:]
-        for(path in configPaths) {
-            try {
-                def dict = yaml.load(new FileInputStream(path))
-                if(dict != null) {
-                    properties = properties + dict
-                }
-            }
-            catch(FileNotFoundException e) {
-                println path + " not found. Skipping."
-            }
-        }
-        return properties
-    }
-
-
     // Saves our loaded and processed config YAML
     // to a Plist in the app bundle
     def saveProcessedConfig(config, toPath) {
-        def plist = new XMLPropertyListConfiguration()
+        def plist = [:]
 
         for(c in config) {
-            plist.addProperty(c.key, c.value)
+            plist[c.key] = c.value
         }
-
         // Save entire config
-        plist.save(new FileWriter(toPath))
+        PropertyListParser.saveAsXML(NSObject.wrap(plist), new File(toPath))
     }
 
     // Modify Info.plist for specific services
@@ -110,13 +67,12 @@ class Configuration {
         // binary plists so make sure it's an xml one
         ['plutil', '-convert', 'xml1', builtInfoPlistPath].execute().waitFor()
 
-        def plist = new XMLPropertyListConfiguration()
-        plist.load(new FileReader(builtInfoPlistPath))
+        def plist = PropertyListParser.parse(new File(builtInfoPlistPath)).toJavaObject()
         return plist
     }
 
     def writeInfoPlist(plist) {
-        plist.save(new FileWriter(builtInfoPlistPath))
+        PropertyListParser.saveAsXML(NSObject.wrap(plist), new File(builtInfoPlistPath))
 
         // Restore to binary for runtime performance
         ['plutil', '-convert', 'binary1', builtInfoPlistPath].execute().waitFor()
@@ -128,39 +84,44 @@ class Configuration {
             'CFBundleURLSchemes' : [scheme]
         ]
 
-        def existing = plist.getProperty('CFBundleURLTypes')
+        def existing = plist['CFBundleURLTypes']
         if(existing) {
             // make sure we don't add it more than once
             def found = false
             for(entry in existing){
-                def schemes = entry.getProperty('CFBundleURLSchemes')
+                def schemes = entry['CFBundleURLSchemes']
                 if(schemes && schemes.contains(scheme)){
                     found = true
                     break
                 }
             }
             if(!found) {
-                existing.add(body)
+                def types = new ArrayList((ArrayList)existing)
+                types.add(body)
+                plist['CFBundleURLTypes'] = types
             }
         }
         else {
-            plist.addProperty("CFBundleURLTypes", [body])
+            plist["CFBundleURLTypes"] = [body]
         }
     }
 
     def addFacebookConfig(config, plist) {
-        def key = config['FACEBOOK_APP_ID']
+        def facebook = config['FACEBOOK'] ?: [:]
+        def key = facebook['FACEBOOK_APP_ID']
         if(!key) {
             return
         }
 
-        plist.addProperty("FacebookAppID", key)
+        plist["FacebookAppID"] = key
         def scheme = "fb" + key
         addURLScheme(scheme, plist)
     }
 
     def addFabricConfig(config, plist) {
-        def key = config['FABRIC_KEY']
+        def fabric = config['FABRIC'] ?: [:]
+        
+        def key = fabric['FABRIC_KEY']
         if(!key) {
             return
         }
@@ -174,32 +135,27 @@ class Configuration {
                 ]
             ]
         ]
-        plist.addProperty("Fabric", body)
+        plist["Fabric"] = body
+    }
+
+    def addGoogleConfig(config, plist) {
+        def google = config['GOOGLE'] ?: [:]
+
+        def key = google['GOOGLE_PLUS_KEY']
+        if(!key) {
+            return
+        }
+
+        // Google login schemes are the reverse DNS of the api key
+        def scheme = key.tokenize('.').reverse().join('.')
+        addURLScheme(scheme, plist)
     }
 
 }
 
-// Expose Configuration
-project.ext.edx = new Configuration()
-
-try {
-    apply from: 'edx.properties'
-}
-catch(GradleException e) {
-    println "Could not load edx.properties, using default configuration."
-}
-
-def configPath = (edx.dir + '/' + 'edx.properties') 
-try {
-    apply from: configPath
-}
-catch(GradleException e) {
-    println "Configuration in " + configPath + " is malformed."
-    throw new GradleException(e);
-}
 
 // Tasks 
-task showBuildEnvironment(type : Exec) {
+task printBuildEnvironment(type : Exec) {
     def arguments = [
         'xcodebuild',
         '-workspace', workspace,
@@ -210,76 +166,75 @@ task showBuildEnvironment(type : Exec) {
 }
 
 task uploadDebuggingSymbols << {
-    def config = edx.loadConfig()
-    def key = config['FABRIC_KEY']
-    def secret = config['FABRIC_BUILD_SECRET']
+    def taskHelper = new TaskHelper()
+    def config = taskHelper.loadConfig(project)
+    def fabric = config['FABRIC'] ?: [:]
+    def key = fabric['FABRIC_KEY']
+    def secret = fabric['FABRIC_BUILD_SECRET']
     def srcroot = System.getenv()['SRCROOT']
     if(key && secret && srcroot) {
-        [srcroot + "/Libraries/Fabric.framework/run", key, secret].execute().waitFor()
+        [srcroot + "/Pods/Fabric/Fabric.framework/run", key, secret].execute().waitFor()
     }
 }
 
 task applyConfig << {
-    def config = edx.loadConfig()
+    def taskHelper = new TaskHelper()
+    def config = taskHelper.loadConfig(project)
+    def helper = new IOSHelper()
 
     // Save all keys to config.plist
-    edx.saveProcessedConfig(config, edx.bundleConfigPath)
+    helper.saveProcessedConfig(config, helper.bundleConfigPath)
 
     // Save specific fields to Info.plist
-    def plist = edx.readInfoPlist()
-    edx.addFacebookConfig(config, plist)
-    edx.addFabricConfig(config, plist)
-    edx.writeInfoPlist(plist)
+    def plist = helper.readInfoPlist()
+    helper.addFacebookConfig(config, plist)
+    helper.addFabricConfig(config, plist)
+    helper.addGoogleConfig(config, plist)
+    helper.writeInfoPlist(plist)
 
     // double check that the config file actually got made
-    def check = ["[", "-f", edx.bundleConfigPath, "]"].execute()
+    def check = ["[", "-f", helper.bundleConfigPath, "]"].execute()
     check.waitFor()
 
     def result = check.exitValue()
     assert result == 0
 }
 
-task printConfigPath << {
-    println "Your current configuration path is " + edx.dir
+task wrapper(type: Wrapper) {
+    gradleVersion = '2.2.1'
 }
 
-task printConfigFiles << {
-    println "You are loading configuration data from the following:"
-    for(path in edx.configPaths) {
-        println "\t" + path
-    }
+def testBuildArguments(workspace, scheme) {
+    return [
+        'xcodebuild', '-workspace', workspace, '-scheme', scheme, '-sdk', 'iphonesimulator', '-destination', 'platform=iOS Simulator,name=iPhone 6s,OS=9.0','build', 'test'
+    ]
 }
 
-task printConfig << {
-    def config = edx.loadConfig()
-
-    def options = new DumperOptions()
-    options.prettyFlow = true
-
-    def yaml = new Yaml(options)
-
-    println "Your current configuration is:"
-    println yaml.dump(config)
+def RTLSchemeForScheme(scheme) {
+    return scheme + '-RTL'
 }
 
-task format << {
-    description = "Formats the source according to our standard"
-
-    println ""
-    println "This command requires uncrustify (http://uncrustify.sourceforge.net)"
-    println ""
-
-    fileTree("edxVideoLocker").matching {
-        include "**/*.h"
-        include "**/*.m"
-    }
-    .visit { file ->
-        if(!file.isDirectory()) {
-            exec {
-                executable "uncrustify"
-                args '-c', '.uncrustify', '--replace', '--no-backup', '-l', 'OC', file.file.path
-            }
-        }
-    }
+def recordSnapshotsBuildArguments(workspace, scheme) {
+    return testBuildArguments(workspace, scheme) + "OTHER_SWIFT_FLAGS=\$(OTHER_SWIFT_FLAGS) -D RECORD_SNAPSHOTS"
 }
+
+task testDefault(type : Exec) {
+    commandLine testBuildArguments(workspace, scheme)
+}
+
+task testRTL(type : Exec) {
+    commandLine testBuildArguments(workspace, RTLSchemeForScheme(scheme))
+}
+
+task recordSnapshotsDefault(type : Exec) {
+    commandLine recordSnapshotsBuildArguments(workspace, scheme)
+}
+
+task recordSnapshotsRTL(type : Exec) {
+    commandLine recordSnapshotsBuildArguments(workspace, RTLSchemeForScheme(scheme))
+}
+
+task recordSnapshots(dependsOn : [recordSnapshotsDefault, recordSnapshotsRTL]) { }
+
+task test(dependsOn : [testDefault, testRTL]) { }
 
